@@ -198,6 +198,115 @@ int absoluteDiff(int lhs, int rhs) {
     return lhs > rhs ? lhs - rhs : rhs - lhs;
 }
 
+// 宿主 UI 线程内的真实插入符屏幕矩形，同时给出不可用原因。调用方约定
+// rect.bottom=行底=候选窗顶边（"输入行下方"），否则候选窗压住当前输入行。
+// GUITHREADINFO 自带插入符高度（=字体行高）；拿不到时用 caret 宿主窗口的
+// 字体行高，最后退 16px。插入符位于客户区 (0,0)（文档起始）是合法值。
+//
+// 只有本线程真有系统插入符（hwndCaret != null）才返回 true；Electron 等
+// 自绘 caret 宿主无系统插入符，调用方走 TSF 矩形路径。hwndCaret 归属不在
+// 聚焦/前景链、或换算坐标落到工作区之外时同样拒绝——ClientToScreen 对已
+// 销毁/隐藏宿主能"成功"吐出废坐标，采用它就是候选窗钉左上角的来源。
+bool realCaretScreenRect(RECT* rect, const wchar_t** whyNot) {
+    static const wchar_t kNoCaret[] = L"no system caret";
+    static const wchar_t kForeignOwner[] = L"caret owned by another window";
+    static const wchar_t kOffScreen[] = L"caret outside work area";
+    if (whyNot) {
+        *whyNot = kNoCaret;
+    }
+    if (!rect) {
+        return false;
+    }
+
+    const DWORD currentThreadId = ::GetCurrentThreadId();
+    GUITHREADINFO guiInfo{};
+    guiInfo.cbSize = sizeof(guiInfo);
+    HWND caretOwner = nullptr;
+    POINT caretTop{};
+    int caretHeight = 0;
+    if (::GetGUIThreadInfo(currentThreadId, &guiInfo)) {
+        caretOwner = guiInfo.hwndCaret;
+        if (caretOwner != nullptr) {
+            caretTop = {guiInfo.rcCaret.left, guiInfo.rcCaret.top};
+            caretHeight = guiInfo.rcCaret.bottom - guiInfo.rcCaret.top;
+        }
+    }
+    if (caretOwner == nullptr) {
+        // 本 UI 线程没有系统插入符（自绘 caret 宿主）：不猜，交给 TSF 路径。
+        return false;
+    }
+
+    // 归属校验：插入符必须属于当前聚焦/前景窗口，或其父链上有本线程的可见
+    // 顶层窗（TSF 按键/edit session 与焦点窗同线程的典型情况）。否则就是别
+    // 处残留的插入符，其 ClientToScreen 坐标是废的，拒绝采用。
+    const HWND focus = ::GetFocus();
+    const HWND foreground = ::GetForegroundWindow();
+    bool owned = caretOwner == focus || caretOwner == foreground;
+    for (HWND candidate = caretOwner; !owned && candidate != nullptr;
+         candidate = ::GetParent(candidate)) {
+        DWORD windowThreadId = 0;
+        ::GetWindowThreadProcessId(candidate, &windowThreadId);
+        if (windowThreadId == currentThreadId && ::IsWindowVisible(candidate)) {
+            owned = true;
+        }
+    }
+    if (!owned) {
+        if (whyNot) {
+            *whyNot = kForeignOwner;
+        }
+        return false;
+    }
+
+    if (caretHeight <= 0) {
+        caretHeight = 16;
+        const HFONT font = (HFONT)::SendMessage(caretOwner, WM_GETFONT, 0, 0);
+        if (font != nullptr) {
+            const HDC dc = ::GetDC(caretOwner);
+            if (dc != nullptr) {
+                const HFONT oldFont = (HFONT)::SelectObject(dc, font);
+                TEXTMETRIC metrics{};
+                if (::GetTextMetrics(dc, &metrics) && metrics.tmHeight > 0) {
+                    caretHeight = metrics.tmHeight + metrics.tmExternalLeading;
+                }
+                ::SelectObject(dc, oldFont);
+                ::ReleaseDC(caretOwner, dc);
+            }
+        }
+    }
+
+    if (!::ClientToScreen(caretOwner, &caretTop)) {
+        return false;
+    }
+
+    // 成功换算后必须仍在某显示器工作区内，否则视为无 caret，回 TSF 路径，
+    // 不污染 last-good。
+    const HMONITOR caretMonitor = ::MonitorFromPoint(caretTop, MONITOR_DEFAULTTONULL);
+    if (caretMonitor == nullptr) {
+        if (whyNot) {
+            *whyNot = kOffScreen;
+        }
+        return false;
+    }
+    MONITORINFO monitorInfo{};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    if (::GetMonitorInfo(caretMonitor, &monitorInfo)) {
+        const RECT work = monitorInfo.rcWork;
+        if (caretTop.x < work.left || caretTop.x > work.right ||
+            caretTop.y < work.top || caretTop.y > work.bottom) {
+            if (whyNot) {
+                *whyNot = kOffScreen;
+            }
+            return false;
+        }
+    }
+
+    rect->left = caretTop.x;
+    rect->right = caretTop.x;
+    rect->top = caretTop.y;
+    rect->bottom = caretTop.y + caretHeight;
+    return true;
+}
+
 int inputRectScore(const RECT& rect, const RECT* foregroundRect, bool preferSelection) {
     int score = preferSelection ? 1 : 0;
     const int width = rect.right - rect.left;
@@ -254,6 +363,8 @@ TextService::TextService(ImeModule* module):
     testKeyUpPending_(false),
     dummyCompositionActive_(false),
     autoDummyCompositionAnchorEnabled_(false),
+    lastKnownGoodInputRect_{},
+    hasLastKnownGoodInputRect_(false),
     langBarSinkCookie_(TF_INVALID_COOKIE) {
 
 }
@@ -401,6 +512,7 @@ void TextService::startComposition(ITfContext* context) {
                 if (range) {
                     composition_ = nullptr;
                     dummyCompositionActive_ = false;
+                    hasLastKnownGoodInputRect_ = false;
                     if (contextComposition->StartComposition(cookie, range, (ITfCompositionSink*)this, &composition_) == S_OK) {
                         ComPtr<ITfRange> compositionRange;
                         if (composition_->GetRange(&compositionRange) != S_OK) {
@@ -486,6 +598,7 @@ void TextService::endComposition(ITfContext* context) {
                 onCompositionTerminated(false);
                 composition_ = nullptr;
                 dummyCompositionActive_ = false;
+                hasLastKnownGoodInputRect_ = false;
                 logTextServiceDebug(L"[endComposition] ended dummy_anchor=false");
             }
         }
@@ -537,6 +650,9 @@ void TextService::setCompositionString(EditSession* session, const wchar_t* str,
                     if (!preserveDummyAnchor) {
                         compositionRange->SetText(editCookie, TF_ST_CORRECTION, str, len);
                         dummyCompositionActive_ = false;
+                        // 外显文本落定后 dummy 锚无意义但 last-good 应保留——
+                        // 上面 startComposition 处清零保证每轮组字都从新鲜矩形开始；
+                        // 此处不清，保证长组字里 TSF 偶发坏矩形时有 last-good 可回退。
                         logTextServiceDebug(
                             L"[setCompositionString] updated len=" + std::to_wstring(len) +
                             L" dummy_anchor=false");
@@ -1253,6 +1369,7 @@ STDMETHODIMP TextService::OnCompositionTerminated(TfEditCookie ecWrite, ITfCompo
     onCompositionTerminated(true);
     composition_ = nullptr;
     dummyCompositionActive_ = false;
+    hasLastKnownGoodInputRect_ = false;
     logTextServiceDebug(L"[OnCompositionTerminated] forced termination dummy_anchor=false");
     return S_OK;
 }
@@ -1341,6 +1458,32 @@ bool TextService::inputRect(EditSession* session, RECT* rect) const {
     if (!session || !rect) {
         return false;
     }
+    // 位置取数顺序（每一轮组字都从新鲜证据开始）：
+    //   1. 本 UI 线程的真实系统插入符（hwndCaret 存在 + 归属校验通过）——
+    //      换行/挪光标后立即正确，组字期间光标不动、天然无抖动；这是记事本
+    //      / 终端类宿主的快路。
+    //   2. TSF GetTextExt 矩形——Electron 等自绘 caret 宿主（无系统插入符）
+    //      的主路。组字起点优先：composition 矩形取的是 Collapse 到
+    //      TF_ANCHOR_START 的起点行，组字期间恒定不动（微软拼音行为：组字
+    //      期间候选固定在首键处）；selection 是跟随键入的"打字机光标"，只在
+    //      composition 缺失/不可信时用——用它才会逐键右偏抖动。
+    //   3. 同组字 last-good：TSF 偶发坏矩形时保持候选窗稳定，不跳左上角。
+    //      bad_rect 且 isComposing 时 dummy 锚写入零宽串让 host 有锚可查，
+    //      重采后记 last-good。
+    RECT caretRect{};
+    const wchar_t* caretWhyNot = nullptr;
+    if (realCaretScreenRect(&caretRect, &caretWhyNot)) {
+        *rect = caretRect;
+        lastKnownGoodInputRect_ = caretRect;
+        hasLastKnownGoodInputRect_ = true;
+        logTextServiceDebug(
+            L"[inputRect] source=real-caret rect=" + rectToString(*rect));
+        return true;
+    }
+    if (caretWhyNot != nullptr) {
+        logTextServiceDebug(
+            L"[inputRect] real caret unavailable: " + std::wstring(caretWhyNot));
+    }
 
     RECT foregroundRect = {};
     const RECT* foregroundRectPtr = getForegroundWindowRect(&foregroundRect) ? &foregroundRect : nullptr;
@@ -1408,6 +1551,14 @@ bool TextService::inputRect(EditSession* session, RECT* rect) const {
     }
 
     if (!snapshot.hasCompositionStartRect && !snapshot.hasSelectionRectValue) {
+        if (hasLastKnownGoodInputRect_) {
+            // TSF 本轮无可用矩形：同组字内复用 last-good，保持候选窗稳定，
+            // 不跳到 (0,0) / 左上角。换行/挪光标后的首个有效矩形会自动接管。
+            *rect = lastKnownGoodInputRect_;
+            logTextServiceDebug(
+                L"[inputRect] source=last-good rect=" + rectToString(*rect));
+            return true;
+        }
         logTextServiceDebug(
             L"[inputRect] failed dummy_anchor=" + boolText(dummyCompositionActive_) +
             L" auto_dummy=" + boolText(autoDummyCompositionAnchorEnabled_) +
@@ -1415,11 +1566,37 @@ bool TextService::inputRect(EditSession* session, RECT* rect) const {
         return false;
     }
 
-    const bool chooseSelection =
-        snapshot.hasSelectionRectValue &&
-        (!snapshot.hasCompositionStartRect || snapshot.selectionScore >= snapshot.compositionScore);
+    // 组字起点优先：composition 矩形取自 Collapse(TF_ANCHOR_START) 的起点
+    // 行，组字期间恒定——候选固定在首键处（微软拼音行为）。selection 是
+    // 跟随键入的"打字机光标"，只在 composition 缺失/不可信时用。
+    // tryAdjustRectWithForegroundCaret 只修正"明显越界"的矩形（游戏/全屏
+    // host 报相对坐标），正常宿主返回 false，不改变择优结果。
+    //
+    // 可信门槛（score >= 0）复用 inputRectScore：前景窗外 -20、左上
+    // 4px 宽"伪锚点" -80——这两类是 TSF 宿主的典型废矩形，直接判不可信，
+    // 走 selection 回退或同组字 last-good，不送出去。
+    const bool compositionUsable = snapshot.hasCompositionStartRect &&
+        snapshot.compositionScore >= 0;
+    const bool chooseSelection = !compositionUsable && snapshot.hasSelectionRectValue;
     *rect = chooseSelection ? snapshot.selectionRectValue : snapshot.compositionStartRect;
     const bool adjusted = tryAdjustRectWithForegroundCaret(rect);
+
+    // bad_rect（两个候选都没过前景窗打分）且非 adjusted：矩形不可信——
+    // 同组字内回 last-good，不把脏矩形记下来也不送出去。注意最后真正送
+    // 出去的若是 selection（composition 不可用时的回退），它每键跟随光标，
+    // 仍可能逐键右移——此时记 last-good 会把"移动错觉"带进后续回退；
+    // 只有恒定的 composition-start 才值得记忆。
+    if (bestScore() < 0 && !adjusted && hasLastKnownGoodInputRect_) {
+        *rect = lastKnownGoodInputRect_;
+        logTextServiceDebug(
+            L"[inputRect] source=last-good(fallback-from-bad-rect) rect=" +
+            rectToString(*rect));
+        return true;
+    }
+    if (!chooseSelection) {
+        lastKnownGoodInputRect_ = *rect;
+        hasLastKnownGoodInputRect_ = true;
+    }
 
     logTextServiceDebug(
         L"[inputRect] source=" + std::wstring(chooseSelection ? L"selection" : L"composition-start") +

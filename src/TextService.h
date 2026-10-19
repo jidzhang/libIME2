@@ -316,6 +316,12 @@ private:
     ComPtr<ITfComposition> composition_; // acquired when starting composition, released when ending composition
     mutable bool dummyCompositionActive_;
     mutable bool autoDummyCompositionAnchorEnabled_;
+    // 同一次组字内最后一次可用的输入行矩形（屏幕坐标，bottom=行底）。自绘
+    // caret / GetTextExt 失败的宿主在按住翻行时仍会推陈旧矩形；同组字内
+    // 复用 last-good 保持候选窗稳定，换行/挪光标后的首个有效矩形会自动
+    // 接管。endComposition / onCompositionTerminated 清零。
+    mutable RECT lastKnownGoodInputRect_;
+    mutable bool hasLastKnownGoodInputRect_;
     ComPtr<ITfLangBarMgr> langBarMgr_;
     std::vector<ComPtr<LangBarButton>> langBarButtons_;
     std::vector<PreservedKey> preservedKeys_;
