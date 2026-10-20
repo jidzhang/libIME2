@@ -51,34 +51,42 @@ DebugLogLevel parseDebugLogLevel(const std::string& raw) {
         return static_cast<char>(std::tolower(ch));
     });
 
-    const size_t keyPos = text.find("\"loglevel\"");
-    if (keyPos == std::string::npos) {
-        return DebugLogLevel::Off;
-    }
+    // 配置文件里可能同时存在 "logLevel"（启动器侧）与 "loglevel"（前端侧）
+    // 两个键（大小写不同、语义相同，小写化后同名），且书写顺序不定。旧实现
+    // 只取第一个匹配：`{"logLevel":"debug","loglevel":"trace"}` 会先命中
+    // "logLevel"→"debug"，前端 trace 埋点（tsf-debug.log / candidate-window.log）
+    // 永久失效。改为扫描全部匹配取最高档。
+    DebugLogLevel best = DebugLogLevel::Off;
+    size_t searchFrom = 0;
+    while (true) {
+        const size_t keyPos = text.find("\"loglevel\"", searchFrom);
+        if (keyPos == std::string::npos) {
+            break;
+        }
+        searchFrom = keyPos + 1;
 
-    const size_t colonPos = text.find(':', keyPos);
-    if (colonPos == std::string::npos) {
-        return DebugLogLevel::Off;
-    }
+        const size_t colonPos = text.find(':', keyPos);
+        if (colonPos == std::string::npos) {
+            break;
+        }
+        const size_t firstQuote = text.find('"', colonPos);
+        if (firstQuote == std::string::npos) {
+            break;
+        }
+        const size_t secondQuote = text.find('"', firstQuote + 1);
+        if (secondQuote == std::string::npos) {
+            break;
+        }
 
-    const size_t firstQuote = text.find('"', colonPos);
-    if (firstQuote == std::string::npos) {
-        return DebugLogLevel::Off;
+        const std::string value = text.substr(firstQuote + 1, secondQuote - firstQuote - 1);
+        if (value == "trace" && best < DebugLogLevel::Trace) {
+            best = DebugLogLevel::Trace;
+        } else if (value == "debug" && best < DebugLogLevel::Debug) {
+            best = DebugLogLevel::Debug;
+        }
+        searchFrom = secondQuote + 1;
     }
-
-    const size_t secondQuote = text.find('"', firstQuote + 1);
-    if (secondQuote == std::string::npos) {
-        return DebugLogLevel::Off;
-    }
-
-    const std::string value = text.substr(firstQuote + 1, secondQuote - firstQuote - 1);
-    if (value == "trace") {
-        return DebugLogLevel::Trace;
-    }
-    if (value == "debug") {
-        return DebugLogLevel::Debug;
-    }
-    return DebugLogLevel::Off;
+    return best;
 }
 
 } // namespace

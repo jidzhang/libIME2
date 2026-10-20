@@ -34,6 +34,9 @@ public:
     ImeWindow(TextService* service);
     virtual ~ImeWindow(void);
     void move(int x, int y);
+    TextService* textService() {
+        return textService_;
+    }
     bool isImmersive() {
         return textService_->isImmersive();
     }

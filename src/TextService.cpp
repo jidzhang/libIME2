@@ -198,6 +198,47 @@ int absoluteDiff(int lhs, int rhs) {
     return lhs > rhs ? lhs - rhs : rhs - lhs;
 }
 
+// 系统 UI 字体（菜单/消息框字体）行高，供"宿主字体取不到"时的参照上界。
+// 真实插入符高度 = 其所在行高，不会比系统 UI 行高还高 3 倍；自绘宿主把
+// caret 高度报成整个输入框高度时（内网通实测 100px = 框高），用这个值兜底。
+int systemUiLineHeight() {
+    static int cachedLineHeight = 0;
+    if (cachedLineHeight > 0) {
+        return cachedLineHeight;
+    }
+
+    int lineHeight = 0;
+    NONCLIENTMETRICSW metrics{};
+    metrics.cbSize = sizeof(metrics);
+    if (::SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0)) {
+        const HDC dc = ::GetDC(nullptr);
+        if (dc != nullptr) {
+            const HFONT font = ::CreateFontIndirectW(&metrics.lfMessageFont);
+            if (font != nullptr) {
+                const HFONT oldFont = (HFONT)::SelectObject(dc, font);
+                TEXTMETRIC textMetrics{};
+                if (::GetTextMetrics(dc, &textMetrics)) {
+                    lineHeight = textMetrics.tmHeight + textMetrics.tmExternalLeading;
+                }
+                ::SelectObject(dc, oldFont);
+                ::DeleteObject(font);
+            }
+            ::ReleaseDC(nullptr, dc);
+        }
+    }
+    if (lineHeight <= 0) {
+        lineHeight = 16;
+    }
+    cachedLineHeight = lineHeight;
+    return cachedLineHeight;
+}
+
+// 矩形高度是否"像整个输入框"而不是"像一行文字"。只在插入符高度已经可疑
+// 时用于交叉校验 TSF 矩形，正常宿主不受影响。
+bool looksLikeHostBox(const RECT& rect) {
+    return (rect.bottom - rect.top) > systemUiLineHeight() * 3;
+}
+
 // 宿主 UI 线程内的真实插入符屏幕矩形，同时给出不可用原因。调用方约定
 // rect.bottom=行底=候选窗顶边（"输入行下方"），否则候选窗压住当前输入行。
 // GUITHREADINFO 自带插入符高度（=字体行高）；拿不到时用 caret 宿主窗口的
@@ -207,12 +248,20 @@ int absoluteDiff(int lhs, int rhs) {
 // 自绘 caret 宿主无系统插入符，调用方走 TSF 矩形路径。hwndCaret 归属不在
 // 聚焦/前景链、或换算坐标落到工作区之外时同样拒绝——ClientToScreen 对已
 // 销毁/隐藏宿主能"成功"吐出废坐标，采用它就是候选窗钉左上角的来源。
-bool realCaretScreenRect(RECT* rect, const wchar_t** whyNot) {
+//
+// heightSuspicious（可空）：宿主把 caret 高度报成整个输入框高度时为 true，
+// 此时返回的 rect 已按系统 UI 行高折行处理，调用方应优先改用 TSF 行矩形
+// （见 inputRect）。内网通实测：宽 1px 打字列正确、高 100px = 框高、窗口
+// 未设字体（WM_GETFONT 空），只有这条兜底能吃到。
+bool realCaretScreenRect(RECT* rect, const wchar_t** whyNot, bool* heightSuspicious) {
     static const wchar_t kNoCaret[] = L"no system caret";
     static const wchar_t kForeignOwner[] = L"caret owned by another window";
     static const wchar_t kOffScreen[] = L"caret outside work area";
     if (whyNot) {
         *whyNot = kNoCaret;
+    }
+    if (heightSuspicious) {
+        *heightSuspicious = false;
     }
     if (!rect) {
         return false;
@@ -259,6 +308,13 @@ bool realCaretScreenRect(RECT* rect, const wchar_t** whyNot) {
 
     if (caretHeight <= 0) {
         caretHeight = 16;
+    }
+    {
+        // 自绘宿主可能把 caret 高度报成整个输入框的高度（内网通实测：
+        // 宽 1px 打字列正确、高 100px = 框高）。真插入符绝不会高于其行高，
+        // 用窗口字体实测行高做上界钳制；取不到字体时不动（零回归：
+        // 记事本类宿主 caret 高度本就等于行高，钳制是空操作）。
+        int lineHeight = 0;
         const HFONT font = (HFONT)::SendMessage(caretOwner, WM_GETFONT, 0, 0);
         if (font != nullptr) {
             const HDC dc = ::GetDC(caretOwner);
@@ -266,10 +322,29 @@ bool realCaretScreenRect(RECT* rect, const wchar_t** whyNot) {
                 const HFONT oldFont = (HFONT)::SelectObject(dc, font);
                 TEXTMETRIC metrics{};
                 if (::GetTextMetrics(dc, &metrics) && metrics.tmHeight > 0) {
-                    caretHeight = metrics.tmHeight + metrics.tmExternalLeading;
+                    lineHeight = metrics.tmHeight + metrics.tmExternalLeading;
                 }
                 ::SelectObject(dc, oldFont);
                 ::ReleaseDC(caretOwner, dc);
+            }
+        }
+        if (lineHeight > 0) {
+            if (caretHeight <= 0 || caretHeight > lineHeight) {
+                caretHeight = lineHeight;
+            }
+        } else if (caretHeight <= 0) {
+            caretHeight = 16;
+        }
+    }
+    {
+        // 第二道（不依赖宿主字体）：真插入符绝不会比系统 UI 行高还高 3 倍。
+        // 命中即判定"宿主报的是整个输入框"，按系统行高折行，并把可疑标记
+        // 交给调用方去优先采用 TSF 行矩形。
+        const int referenceLineHeight = systemUiLineHeight();
+        if (caretHeight > referenceLineHeight * 3) {
+            caretHeight = referenceLineHeight;
+            if (heightSuspicious) {
+                *heightSuspicious = true;
             }
         }
     }
@@ -1472,7 +1547,9 @@ bool TextService::inputRect(EditSession* session, RECT* rect) const {
     //      重采后记 last-good。
     RECT caretRect{};
     const wchar_t* caretWhyNot = nullptr;
-    if (realCaretScreenRect(&caretRect, &caretWhyNot)) {
+    bool caretHeightSuspicious = false;
+    const bool hasCaretRect = realCaretScreenRect(&caretRect, &caretWhyNot, &caretHeightSuspicious);
+    if (hasCaretRect && !caretHeightSuspicious) {
         *rect = caretRect;
         lastKnownGoodInputRect_ = caretRect;
         hasLastKnownGoodInputRect_ = true;
@@ -1480,10 +1557,34 @@ bool TextService::inputRect(EditSession* session, RECT* rect) const {
             L"[inputRect] source=real-caret rect=" + rectToString(*rect));
         return true;
     }
-    if (caretWhyNot != nullptr) {
+    if (hasCaretRect) {
+        // 插入符高度=整个输入框（自绘宿主病态行为）：caretRect 已按系统行高
+        // 折行，作为兜底；先看 TSF 给出的行矩形，它才是文字行的真位置。
+        logTextServiceDebug(
+            L"[inputRect] caret height looks like host box; caret fallback rect=" +
+            rectToString(caretRect));
+    } else if (caretWhyNot != nullptr) {
         logTextServiceDebug(
             L"[inputRect] real caret unavailable: " + std::wstring(caretWhyNot));
     }
+
+    // 病态插入符宿主：TSF 矩形若同样"像整个输入框"（部分自绘宿主 GetTextExt
+    // 也报框高），一并判不可用，最终回退到折行后的插入符矩形。
+    const auto tsfRectUsable = [&](const RECT& candidate) {
+        return !(caretHeightSuspicious && looksLikeHostBox(candidate));
+    };
+    const auto useCaretFallback = [&](const wchar_t* reason) {
+        if (!hasCaretRect) {
+            return false;
+        }
+        *rect = caretRect;
+        lastKnownGoodInputRect_ = caretRect;
+        hasLastKnownGoodInputRect_ = true;
+        logTextServiceDebug(
+            L"[inputRect] source=caret-line-fallback(" + std::wstring(reason) +
+            L") rect=" + rectToString(*rect));
+        return true;
+    };
 
     RECT foregroundRect = {};
     const RECT* foregroundRectPtr = getForegroundWindowRect(&foregroundRect) ? &foregroundRect : nullptr;
@@ -1559,6 +1660,9 @@ bool TextService::inputRect(EditSession* session, RECT* rect) const {
                 L"[inputRect] source=last-good rect=" + rectToString(*rect));
             return true;
         }
+        if (useCaretFallback(L"no-tsf-rect")) {
+            return true;
+        }
         logTextServiceDebug(
             L"[inputRect] failed dummy_anchor=" + boolText(dummyCompositionActive_) +
             L" auto_dummy=" + boolText(autoDummyCompositionAnchorEnabled_) +
@@ -1576,8 +1680,17 @@ bool TextService::inputRect(EditSession* session, RECT* rect) const {
     // 4px 宽"伪锚点" -80——这两类是 TSF 宿主的典型废矩形，直接判不可信，
     // 走 selection 回退或同组字 last-good，不送出去。
     const bool compositionUsable = snapshot.hasCompositionStartRect &&
-        snapshot.compositionScore >= 0;
-    const bool chooseSelection = !compositionUsable && snapshot.hasSelectionRectValue;
+        snapshot.compositionScore >= 0 &&
+        tsfRectUsable(snapshot.compositionStartRect);
+    const bool chooseSelection = !compositionUsable && snapshot.hasSelectionRectValue &&
+        tsfRectUsable(snapshot.selectionRectValue);
+    if (!compositionUsable && !chooseSelection) {
+        // 两个 TSF 矩形都不可用（缺失、打分不过、或"像整框"）：病态插入符
+        // 宿主优先用折行后的插入符矩形，别把整框矩形送出去。
+        if (useCaretFallback(L"tsf-rect-unusable")) {
+            return true;
+        }
+    }
     *rect = chooseSelection ? snapshot.selectionRectValue : snapshot.compositionStartRect;
     const bool adjusted = tryAdjustRectWithForegroundCaret(rect);
 
@@ -1591,6 +1704,9 @@ bool TextService::inputRect(EditSession* session, RECT* rect) const {
         logTextServiceDebug(
             L"[inputRect] source=last-good(fallback-from-bad-rect) rect=" +
             rectToString(*rect));
+        return true;
+    }
+    if (bestScore() < 0 && !adjusted && useCaretFallback(L"bad-tsf-rect")) {
         return true;
     }
     if (!chooseSelection) {
