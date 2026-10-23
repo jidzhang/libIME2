@@ -636,11 +636,12 @@ void TextService::startComposition(ITfContext* context) {
     context->RequestEditSession(clientId_, editSession, TF_ES_SYNC|TF_ES_READWRITE, &sessionResult);
 }
 
-void TextService::endComposition(ITfContext* context) {
+static void logSelectionTrace(const wchar_t* tag, ITfContext* context, TfEditCookie cookie);
+
+void TextService::endComposition(ITfContext* context, bool clearText) {
     assert(context);
     HRESULT sessionResult;
-    auto editSession = ComPtr<EditSession>::make(
-        context,
+    auto editSession = ComPtr<EditSession>::make(        context,
         [=](EditSession* session, TfEditCookie cookie) {
             if (composition_) {
                 // move current insertion point to end of the composition string
@@ -650,6 +651,11 @@ void TextService::endComposition(ITfContext* context) {
                         logTextServiceDebug(L"[endComposition] clearing dummy anchor");
                         compositionRange->SetText(cookie, 0, L"", 0);
                         dummyCompositionActive_ = false;
+                    } else if (clearText) {
+                        // "清空+普通插入"上屏路径：组字以空文本结束，
+                        // 最终文本由 insertTextAtSelection 普通插入。
+                        compositionRange->SetText(cookie, 0, L"", 0);
+                        logTextServiceDebug(L"[endComposition] cleared composition text");
                     }
 
                     // clear display attribute for the composition range
@@ -657,7 +663,19 @@ void TextService::endComposition(ITfContext* context) {
                     if (context->GetProperty(GUID_PROP_ATTRIBUTE, &dispAttrProp) == S_OK) {
                         dispAttrProp->Clear(cookie, compositionRange);
                     }
+                }
 
+                // EndComposition must happen before the selection is collapsed:
+                // XAML hosts (Sticky Notes, ...) reset the selection on the
+                // end-composition notification and re-select the committed text,
+                // overriding a selection that was set earlier in this edit
+                // session. The composition range object stays valid after
+                // EndComposition, so collapse afterwards instead.
+                // end composition and clean up
+                composition_->EndComposition(cookie);
+                logSelectionTrace(L"endcomp-after-endcomp", context, cookie);
+
+                if (compositionRange) {
                     TF_SELECTION selection;
                     ULONG selectionNum;
                     if (context->GetSelection(cookie, TF_DEFAULT_SELECTION, 1, &selection, &selectionNum) == S_OK) {
@@ -667,8 +685,7 @@ void TextService::endComposition(ITfContext* context) {
                         selection.range->Release();
                     }
                 }
-                // end composition and clean up
-                composition_->EndComposition(cookie);
+                logSelectionTrace(L"endcomp-after-setselection", context, cookie);
                 // do some cleanup in the derived class here
                 onCompositionTerminated(false);
                 composition_ = nullptr;
@@ -679,6 +696,132 @@ void TextService::endComposition(ITfContext* context) {
         }
     );
     context->RequestEditSession(clientId_, editSession, TF_ES_SYNC|TF_ES_READWRITE, &sessionResult);
+    collapseSelectionAfterCompositionEnd(context);
+}
+
+// 上屏选区追踪：dump 当前 TSF 选区（ACP 位置），定位宿主（便笺/XAML）把
+// 选区改回"整段选中"发生在哪一步。trace 档才输出。
+static void logSelectionTrace(const wchar_t* tag, ITfContext* context, TfEditCookie cookie) {
+    if (!context) {
+        logTextServiceDebug(std::wstring(L"[selTrace] ") + tag + L" no-context");
+        return;
+    }
+    TF_SELECTION sel;
+    ULONG num = 0;
+    const HRESULT hr = context->GetSelection(cookie, TF_DEFAULT_SELECTION, 1, &sel, &num);
+    if (hr != S_OK) {
+        logTextServiceDebug(std::wstring(L"[selTrace] ") + tag +
+                            L" GetSelection-failed hr=0x" + std::to_wstring(static_cast<unsigned long>(hr)));
+        return;
+    }
+    std::wstring line = std::wstring(L"[selTrace] ") + tag + L" num=" + std::to_wstring(num);
+    if (num >= 1 && sel.range) {
+        ComPtr<ITfRangeACP> acp = ComPtr<ITfRangeACP>::queryFrom(sel.range);
+        if (acp) {
+            LONG start = 0, length = 0;
+            if (acp->GetExtent(&start, &length) == S_OK) {
+                line += L" extent=[" + std::to_wstring(start) + L"," + std::to_wstring(start + length) + L"]";
+            }
+        } else {
+            line += L" non-acp-range";
+        }
+        sel.range->Release();
+    }
+    logTextServiceDebug(line);
+}
+
+// 折叠非退化选区的独立编辑会话。tag 仅用于日志。
+static void requestSelectionCollapseSession(ITfContext* context, TfClientId clientId, DWORD flags, const wchar_t* tag) {
+    HRESULT sessionResult;
+    auto editSession = ComPtr<EditSession>::make(
+        context,
+        [=](EditSession* session, TfEditCookie cookie) {
+            ITfContext* ctx = session->context();
+            logSelectionTrace(tag, ctx, cookie);
+            TF_SELECTION selection;
+            ULONG selectionNum = 0;
+            if (ctx->GetSelection(cookie, TF_DEFAULT_SELECTION, 1, &selection, &selectionNum) != S_OK) {
+                logTextServiceDebug(std::wstring(L"[selTrace] collapse-") + tag + L" GetSelection-failed");
+                return;
+            }
+            if (selectionNum != 1 || !selection.range) {
+                if (selection.range) {
+                    selection.range->Release();
+                }
+                logTextServiceDebug(std::wstring(L"[selTrace] collapse-") + tag +
+                                    L" unexpected-num=" + std::to_wstring(selectionNum));
+                return;
+            }
+            // 选区退化（已是插入点）就不用再设
+            LONG degenerate = 1;
+            if (selection.range->CompareStart(cookie, selection.range, TF_ANCHOR_END, &degenerate) == S_OK && degenerate == 0) {
+                selection.range->Release();
+                return;
+            }
+            // 折叠到右端（反向选区时右端是 start 锚）
+            LONG reversed = 0;
+            selection.range->CompareStart(cookie, selection.range, TF_ANCHOR_END, &reversed);
+            selection.range->Collapse(cookie, reversed > 0 ? TF_ANCHOR_START : TF_ANCHOR_END);
+            const HRESULT hr = ctx->SetSelection(cookie, 1, &selection);
+            selection.range->Release();
+            logTextServiceDebug(std::wstring(L"[selTrace] collapse-") + tag +
+                                L" collapsed hr=0x" + std::to_wstring(static_cast<unsigned long>(hr)));
+        }
+    );
+    context->RequestEditSession(clientId, editSession, flags, &sessionResult);
+}
+
+// XAML 宿主（便笺等）会把刚上屏的组字范围重新选中，同一会话内 SetSelection
+// 的先后都会被覆盖。这里在 endComposition 的会话之后再开独立编辑会话兜底：
+// 一个同步档（上一个会话的全部完成通知之后立即跑），一个异步档（等宿主
+// 消息循环空闲再跑——覆盖宿主在 dispatcher 任务里异步重选的情形）。
+// 正常宿主选区已是插入点，两个档都只做一次 GetSelection 即返回。
+void TextService::collapseSelectionAfterCompositionEnd(ITfContext* context) {
+    assert(context);
+    requestSelectionCollapseSession(context, clientId_, TF_ES_SYNC | TF_ES_READWRITE, L"sync");
+    requestSelectionCollapseSession(context, clientId_, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, L"async");
+}
+
+// 不经组字的普通文本插入：XAML 宿主（便笺等）对"组字带文本定稿"会把定稿
+// 范围整段重新选中（用户 2026-10-23 实测，14 个输入法里仅墨奇触发）。
+// 上屏改走 weasel#107 的老修法：组字清空后结束，最终文本用
+// InsertTextAtSelection 普通插入——应用侧没有"组字定稿"事件可挑，选区由
+// 我们在插入后显式设置为插入点。
+void TextService::insertTextAtSelection(ITfContext* context, const wchar_t* str, int len, int caretFromEnd) {
+    assert(context);
+    HRESULT sessionResult;
+    auto editSession = ComPtr<EditSession>::make(
+        context,
+        [=](EditSession* session, TfEditCookie cookie) {
+            ITfContext* ctx = session->context();
+            auto insertAtSelection = ComPtr<ITfInsertAtSelection>::queryFrom(ctx);
+            if (!insertAtSelection) {
+                logTextServiceDebug(L"[insertTextAtSelection] no ITfInsertAtSelection");
+                return;
+            }
+            ComPtr<ITfRange> range;
+            if (insertAtSelection->InsertTextAtSelection(cookie, 0, str, len, &range) != S_OK || !range) {
+                logTextServiceDebug(L"[insertTextAtSelection] InsertTextAtSelection failed");
+                return;
+            }
+            range->Collapse(cookie, TF_ANCHOR_END);
+            if (caretFromEnd > 0) {
+                LONG moved = 0;
+                range->ShiftStart(cookie, -static_cast<LONG>(caretFromEnd), &moved, nullptr);
+                range->Collapse(cookie, TF_ANCHOR_START);
+            }
+            TF_SELECTION selection;
+            selection.range = range;
+            selection.style.ase = TF_AE_NONE;
+            selection.style.fInterimChar = FALSE;
+            const HRESULT hr = ctx->SetSelection(cookie, 1, &selection);
+            logTextServiceDebug(std::wstring(L"[insertTextAtSelection] done len=") +
+                                std::to_wstring(len) + L" caret_from_end=" + std::to_wstring(caretFromEnd) +
+                                L" set_selection_hr=0x" + std::to_wstring(static_cast<unsigned long>(hr)));
+            logSelectionTrace(L"insert-done", ctx, cookie);
+        }
+    );
+    context->RequestEditSession(clientId_, editSession, TF_ES_SYNC | TF_ES_READWRITE, &sessionResult);
 }
 
 std::wstring TextService::compositionString(EditSession* session) const {
@@ -706,7 +849,7 @@ std::wstring TextService::compositionString(EditSession* session) const {
     return result;
 }
 
-void TextService::setCompositionString(EditSession* session, const wchar_t* str, int len) const {
+void TextService::setCompositionString(EditSession* session, const wchar_t* str, int len, bool isFinalCommit) const {
     ITfContext* context = session->context();
     if(context) {
         TfEditCookie editCookie = session->editCookie();
@@ -723,7 +866,10 @@ void TextService::setCompositionString(EditSession* session, const wchar_t* str,
 
                     // replace context of composion area with the new string.
                     if (!preserveDummyAnchor) {
-                        compositionRange->SetText(editCookie, TF_ST_CORRECTION, str, len);
+                        // 组字中间更新用 TF_ST_CORRECTION（不打断撤销链）；最终上屏
+                        // 文本必须用 0——XAML 宿主会把"correction"改动的范围重新
+                        // 选中（便笺上屏后全选的来源之一）。
+                        compositionRange->SetText(editCookie, isFinalCommit ? 0 : TF_ST_CORRECTION, str, len);
                         dummyCompositionActive_ = false;
                         // 外显文本落定后 dummy 锚无意义但 last-good 应保留——
                         // 上面 startComposition 处清零保证每轮组字都从新鲜矩形开始；
@@ -740,6 +886,9 @@ void TextService::setCompositionString(EditSession* session, const wchar_t* str,
                     if (!preserveDummyAnchor) {
                         selection.range->Collapse(editCookie, TF_ANCHOR_END);
                         context->SetSelection(editCookie, 1, &selection);
+                        if (isFinalCommit) {
+                            logSelectionTrace(L"commit-settext-done", context, editCookie);
+                        }
                     }
                 }
 

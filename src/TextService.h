@@ -136,15 +136,30 @@ public:
 
     bool isInsertionAllowed(EditSession* session) const;
     void startComposition(ITfContext* context);
-    void endComposition(ITfContext* context);
+    // clearText：结束前把组字文本清空（上屏走"清空+普通插入"路径时用，
+    // 见 insertTextAtSelection——组字带文本定稿时 XAML 宿主会把定稿范围
+    // 重新选中，清空后结束则绕开该路径）。
+    void endComposition(ITfContext* context, bool clearText = false);
+    // 不经组字的普通文本插入（direct commit）：InsertTextAtSelection(flags=0)
+    // 后把选区折叠到插入文本末尾左移 caretFromEnd 处（自动配对符号传 1，
+    // 光标落在配对中间；普通上屏传 0）。
+    void insertTextAtSelection(ITfContext* context, const wchar_t* str, int len, int caretFromEnd = 0);
     bool compositionRect(EditSession* session, RECT* rect) const;
     bool inputRect(EditSession* session, RECT* rect) const;
     bool selectionRect(EditSession* session, RECT* rect) const;
     HWND compositionWindow(EditSession* session) const;
 
     std::wstring compositionString(EditSession* session) const;
-    void setCompositionString(EditSession* session, const wchar_t* str, int len) const;
+    // isFinalCommit：上屏最终文本。XAML 宿主对带 TF_ST_CORRECTION 的文本变化
+    // 会把改动范围重新选中（便笺上屏后全选），最终上屏必须用 flags=0。
+    void setCompositionString(EditSession* session, const wchar_t* str, int len, bool isFinalCommit = false) const;
     void setCompositionCursor(EditSession* session, int pos) const;
+
+    // 组字结束后兜底把非退化选区折叠成插入点。XAML 宿主在编辑会话完成通知
+    // （OnEndEdit）里重置选区，同一会话内 SetSelection 的先后都会被覆盖；
+    // 这个后续会话在上一个会话全部通知之后运行。正常宿主选区已是插入点，
+    // 这里是空操作。
+    void collapseSelectionAfterCompositionEnd(ITfContext* context);
 
     // compartment handling
     ComPtr<ITfCompartment> globalCompartment(const GUID& key) const;
