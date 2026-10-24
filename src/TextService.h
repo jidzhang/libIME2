@@ -146,6 +146,10 @@ public:
     void insertTextAtSelection(ITfContext* context, const wchar_t* str, int len, int caretFromEnd = 0);
     bool compositionRect(EditSession* session, RECT* rect) const;
     bool inputRect(EditSession* session, RECT* rect) const;
+    // inputRect 的三级取数主体（真插入符/TSF 组字起点/last-good）。
+    // inputRect 在其外层做"组字期间锚点冻结"（Sublime 类宿主的系统插入符
+    // 随组字末端逐键右移，直接采用会导致候选窗跟着打字走）。
+    bool inputRectFresh(EditSession* session, RECT* rect) const;
     bool selectionRect(EditSession* session, RECT* rect) const;
     HWND compositionWindow(EditSession* session) const;
 
@@ -337,6 +341,13 @@ private:
     // 接管。endComposition / onCompositionTerminated 清零。
     mutable RECT lastKnownGoodInputRect_;
     mutable bool hasLastKnownGoodInputRect_;
+    // 本次组字的起点锚（首键时快照）。部分编辑器（Sublime Text 实测）的系统
+    // 插入符随组字文本末端逐键右移，若直接采用，候选窗会跟着打字一路走
+    // （微软拼音行为是组字期间锚定不动）。组字首键快照、组字期间冻结、
+    // endComposition / onCompositionTerminated 清零。对插入符本就恒定的宿主
+    // （记事本/终端）快照值与逐键值相同，行为不变。
+    mutable RECT compositionAnchorRect_;
+    mutable bool hasCompositionAnchor_;
     ComPtr<ITfLangBarMgr> langBarMgr_;
     std::vector<ComPtr<LangBarButton>> langBarButtons_;
     std::vector<PreservedKey> preservedKeys_;

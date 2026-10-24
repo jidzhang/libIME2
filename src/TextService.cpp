@@ -589,6 +589,7 @@ void TextService::startComposition(ITfContext* context) {
                     composition_ = nullptr;
                     dummyCompositionActive_ = false;
                     hasLastKnownGoodInputRect_ = false;
+                    hasCompositionAnchor_ = false;
                     if (contextComposition->StartComposition(cookie, range, (ITfCompositionSink*)this, &composition_) == S_OK) {
                         ComPtr<ITfRange> compositionRange;
                         if (composition_->GetRange(&compositionRange) != S_OK) {
@@ -692,6 +693,7 @@ void TextService::endComposition(ITfContext* context, bool clearText) {
                 composition_ = nullptr;
                 dummyCompositionActive_ = false;
                 hasLastKnownGoodInputRect_ = false;
+                hasCompositionAnchor_ = false;
                 logTextServiceDebug(L"[endComposition] ended dummy_anchor=false");
             }
         }
@@ -1595,6 +1597,7 @@ STDMETHODIMP TextService::OnCompositionTerminated(TfEditCookie ecWrite, ITfCompo
     composition_ = nullptr;
     dummyCompositionActive_ = false;
     hasLastKnownGoodInputRect_ = false;
+    hasCompositionAnchor_ = false;
     logTextServiceDebug(L"[OnCompositionTerminated] forced termination dummy_anchor=false");
     return S_OK;
 }
@@ -1680,6 +1683,30 @@ bool TextService::compositionRect(EditSession* session, RECT* rect) const {
 }
 
 bool TextService::inputRect(EditSession* session, RECT* rect) const {
+    if (!session || !rect) {
+        return false;
+    }
+    // 组字期间锚点冻结：首键快照、同组字内恒定（微软拼音行为——组字时
+    // 候选窗固定在首键处，不随打字机光标右移）。对插入符本就恒定的宿主
+    // （记事本/终端）快照值与逐键值一致，行为不变；Sublime 这类"系统插入符
+    // 跟随组字末端移动"的宿主由此恢复锚定。
+    if (isComposing() && hasCompositionAnchor_) {
+        *rect = compositionAnchorRect_;
+        logTextServiceDebug(
+            L"[inputRect] source=composition-anchor(frozen) rect=" + rectToString(*rect));
+        return true;
+    }
+    const bool ok = inputRectFresh(session, rect);
+    if (ok && isComposing() && !hasCompositionAnchor_) {
+        compositionAnchorRect_ = *rect;
+        hasCompositionAnchor_ = true;
+        logTextServiceDebug(
+            L"[inputRect] composition anchor recorded rect=" + rectToString(*rect));
+    }
+    return ok;
+}
+
+bool TextService::inputRectFresh(EditSession* session, RECT* rect) const {
     if (!session || !rect) {
         return false;
     }
