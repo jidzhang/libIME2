@@ -478,10 +478,11 @@ void TextService::removeButton(LangBarButton* button) {
     if(button) {
         auto it = find(langBarButtons_.begin(), langBarButtons_.end(), button);
         if(it != langBarButtons_.end()) {
-            if(isActivated()) {
-                if(auto langBarItemMgr = threadMgr_.query<ITfLangBarItemMgr>()) {
-                    langBarItemMgr->RemoveItem(button);
-                }
+            // 调用方之一是 Client 析构（发生在失活进行中，isActivated 已为
+            // false）：只要还能拿到 ITfLangBarItemMgr 就必须 RemoveItem，
+            // 否则 msctf 持有的引用永不释放（2026-10-24 语言栏按钮泄漏）。
+            if(auto langBarItemMgr = threadMgr_.query<ITfLangBarItemMgr>()) {
+                langBarItemMgr->RemoveItem(button);
             }
             langBarButtons_.erase(it);
         }
