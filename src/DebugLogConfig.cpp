@@ -21,7 +21,7 @@ std::wstring configFilePath() {
     if (!localAppData || !*localAppData) {
         return L"";
     }
-    return std::wstring(localAppData) + L"\\MoqiIM\\MoqiLauncher.json";
+    return std::wstring(localAppData) + L"\\MoqiIM\\MoqiLaunch.json";
 }
 
 bool readFileText(const std::wstring& path, std::string* out) {
