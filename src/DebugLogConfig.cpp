@@ -24,6 +24,17 @@ std::wstring configFilePath() {
     return std::wstring(localAppData) + L"\\MoqiIM\\MoqiLaunch.json";
 }
 
+// 启动器设置界面的调试开关写的是 MoqiLauncher.json（PipeServer 的
+// CONFIG_FILE_REL_PATH），与上面的 MoqiLaunch.json 是两个文件名；只读
+// 前者时 UI 开了调试 DLL trace 也永远不生效。两处都读，取最高档。
+std::wstring launcherConfigFilePath() {
+    const wchar_t* localAppData = _wgetenv(L"LOCALAPPDATA");
+    if (!localAppData || !*localAppData) {
+        return L"";
+    }
+    return std::wstring(localAppData) + L"\\MoqiIM\\MoqiLauncher.json";
+}
+
 bool readFileText(const std::wstring& path, std::string* out) {
     if (!out || path.empty()) {
         return false;
@@ -105,6 +116,13 @@ bool isDebugLoggingEnabled() {
     if (readFileText(configFilePath(), &configText)) {
         cachedLevel = parseDebugLogLevel(configText);
     }
+    std::string launcherText;
+    if (readFileText(launcherConfigFilePath(), &launcherText)) {
+        const DebugLogLevel launcherLevel = parseDebugLogLevel(launcherText);
+        if (launcherLevel > cachedLevel) {
+            cachedLevel = launcherLevel;
+        }
+    }
 
     lastRefreshTick = now;
     return cachedLevel >= DebugLogLevel::Debug;
@@ -123,6 +141,13 @@ bool isTraceLoggingEnabled() {
     std::string configText;
     if (readFileText(configFilePath(), &configText)) {
         cachedLevel = parseDebugLogLevel(configText);
+    }
+    std::string launcherText;
+    if (readFileText(launcherConfigFilePath(), &launcherText)) {
+        const DebugLogLevel launcherLevel = parseDebugLogLevel(launcherText);
+        if (launcherLevel > cachedLevel) {
+            cachedLevel = launcherLevel;
+        }
     }
 
     lastRefreshTick = now;

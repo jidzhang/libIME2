@@ -46,4 +46,5 @@ add_library(libIME2_static STATIC
 
 target_link_libraries(libIME2_static
     shlwapi.lib
+    imm32.lib
 )

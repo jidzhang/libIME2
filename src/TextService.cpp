@@ -31,6 +31,7 @@
 #include <sstream>
 #include <string>
 #include <algorithm>
+#include <imm.h>
 
 using namespace std;
 
@@ -237,6 +238,100 @@ int systemUiLineHeight() {
 // 时用于交叉校验 TSF 矩形，正常宿主不受影响。
 bool looksLikeHostBox(const RECT& rect) {
     return (rect.bottom - rect.top) > systemUiLineHeight() * 3;
+}
+
+// 纯 IMM 宿主（wezterm/Alacritty/kitty 类终端）的光标锚点：这类宿主既无系统
+// 插入符也无 TSF 文档，光标位置只通过 IMM32 旧通道告知系统——
+// ImmSetCandidateWindow（wezterm：CFS_EXCLUDE + ptCurrentPos=光标格原点 +
+// rcArea=光标格矩形，客户区坐标）/ ImmSetCompositionWindow。CUAS 不把这些
+// 位置映射进 GetTextExt（实测 composition=none、selection=屏幕右下角 1x0
+// 废矩形），只能由我们在宿主进程内直接读回。前提：TSF 组字会话与宿主同
+// UI 线程，ImmGetContext 恰好只对本线程窗口有效，两者天然成立。
+// 只接受宿主明确声明过位置的形态（CFS_CANDIDATEPOS/CFS_EXCLUDE、
+// CFS_POINT/CFS_FORCE_POSITION）；从未设置过的上下文是 CFS_DEFAULT，不采用。
+bool immAnchorScreenRect(RECT* rect, std::wstring* source) {
+    if (!rect) {
+        return false;
+    }
+    const HWND focus = ::GetFocus();
+    if (!focus) {
+        return false;
+    }
+    const HIMC himc = ::ImmGetContext(focus);
+    if (!himc) {
+        return false;
+    }
+
+    bool ok = false;
+    CANDIDATEFORM cf{};
+    cf.dwIndex = 0;
+    if (::ImmGetCandidateWindow(himc, 0, &cf) &&
+        (cf.dwStyle & (CFS_CANDIDATEPOS | CFS_EXCLUDE)) != 0) {
+        if ((cf.dwStyle & CFS_EXCLUDE) != 0 &&
+            cf.rcArea.right > cf.rcArea.left && cf.rcArea.bottom > cf.rcArea.top) {
+            POINT topLeft{cf.rcArea.left, cf.rcArea.top};
+            POINT bottomRight{cf.rcArea.right, cf.rcArea.bottom};
+            if (::ClientToScreen(focus, &topLeft) && ::ClientToScreen(focus, &bottomRight)) {
+                rect->left = topLeft.x;
+                rect->top = topLeft.y;
+                rect->right = bottomRight.x;
+                rect->bottom = bottomRight.y;
+                ok = true;
+                if (source) {
+                    *source = L"candidate-exclude";
+                }
+            }
+        } else {
+            POINT pt{cf.ptCurrentPos.x, cf.ptCurrentPos.y};
+            if (::ClientToScreen(focus, &pt)) {
+                rect->left = pt.x;
+                rect->top = pt.y;
+                rect->right = pt.x;
+                rect->bottom = pt.y + systemUiLineHeight();
+                ok = true;
+                if (source) {
+                    *source = L"candidate-pos";
+                }
+            }
+        }
+    }
+    if (!ok) {
+        COMPOSITIONFORM compositionForm{};
+        if (::ImmGetCompositionWindow(himc, &compositionForm) &&
+            (compositionForm.dwStyle & (CFS_POINT | CFS_FORCE_POSITION | CFS_RECT)) != 0) {
+            if ((compositionForm.dwStyle & CFS_RECT) != 0 &&
+                compositionForm.rcArea.right > compositionForm.rcArea.left &&
+                compositionForm.rcArea.bottom > compositionForm.rcArea.top) {
+                // CFS_RECT：组字窗约束在 rcArea 内，锚点取其首行
+                POINT topLeft{compositionForm.rcArea.left, compositionForm.rcArea.top};
+                POINT bottomRight{compositionForm.rcArea.right, compositionForm.rcArea.bottom};
+                if (::ClientToScreen(focus, &topLeft) && ::ClientToScreen(focus, &bottomRight)) {
+                    rect->left = topLeft.x;
+                    rect->top = topLeft.y;
+                    rect->right = bottomRight.x;
+                    rect->bottom = bottomRight.y;
+                    ok = true;
+                    if (source) {
+                        *source = L"composition-rect";
+                    }
+                }
+            } else {
+                POINT pt{compositionForm.ptCurrentPos.x, compositionForm.ptCurrentPos.y};
+                if (::ClientToScreen(focus, &pt)) {
+                    rect->left = pt.x;
+                    rect->top = pt.y;
+                    rect->right = pt.x;
+                    rect->bottom = pt.y + systemUiLineHeight();
+                    ok = true;
+                    if (source) {
+                        *source = L"composition-point";
+                    }
+                }
+            }
+        }
+    }
+    ::ImmReleaseContext(focus, himc);
+    return ok;
 }
 
 // 宿主 UI 线程内的真实插入符屏幕矩形，同时给出不可用原因。调用方约定
@@ -1816,6 +1911,25 @@ bool TextService::inputRectFresh(EditSession* session, RECT* rect) const {
     const auto bestScore = [&]() {
         return (std::max)(snapshot.compositionScore, snapshot.selectionScore);
     };
+
+    // 纯 IMM 宿主救援：两个 TSF 矩形都不可信（缺失/前景窗外废矩形）时，
+    // 旧行为会被 tryAdjustRectWithForegroundCaret 钉到前景窗左上角（wezterm
+    // 实测即用户报的"候选窗一直在左上角"）。先试 IMM32 旧通道里宿主报过的
+    // 光标位置。TSF 矩形可用的宿主（记事本/Electron/WT）bestScore >= 0，
+    // 到不了这里，零回归；IMM 数据也要过前景窗打分才采用。
+    if (bestScore() < 0) {
+        RECT immRect{};
+        std::wstring immSource;
+        if (immAnchorScreenRect(&immRect, &immSource) &&
+            inputRectScore(immRect, foregroundRectPtr, false) >= 0) {
+            *rect = immRect;
+            lastKnownGoodInputRect_ = immRect;
+            hasLastKnownGoodInputRect_ = true;
+            logTextServiceDebug(
+                L"[inputRect] source=imm32-" + immSource + L" rect=" + rectToString(immRect));
+            return true;
+        }
+    }
 
     if ((!snapshot.hasCompositionStartRect && !snapshot.hasSelectionRectValue) ||
         bestScore() < 0) {
