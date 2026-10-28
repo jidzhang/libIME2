@@ -133,12 +133,14 @@ ImeModule::ImeModule(HMODULE module, const CLSID& textServiceClsid):
 
     Window::registerClass(hInstance_);
 
-    // regiser default display attributes
+    // 组字显示属性只描述"样式"，颜色全部让位给宿主（对齐 Weasel 的
+    // TF_CT_NONE 做法）。TF_CT_*SYSCOLOR 会被自绘 preedit 的宿主当成实色：
+    // Windows Terminal 只有 crText.type == crBk.type 时才上色，于是终端里
+    // 组字被刷成 COLOR_WINDOW 白底 + COLOR_WINDOWTEXT 黑字（深色终端主题下
+    // 就是一块刺眼的反色）；便签等 XAML 宿主同理。深色/彩色主题下 syscolor
+    // 与宿主实际底色无关，任何实色都只可能更糟。
     inputAttrib_ = ComPtr<DisplayAttributeInfo>::make(g_inputDisplayAttributeGuid);
-    inputAttrib_->setTextSysColor(COLOR_WINDOWTEXT);
-    inputAttrib_->setBackgroundSysColor(COLOR_WINDOW);
     inputAttrib_->setLineStyle(TF_LS_DOT);
-    inputAttrib_->setLineSysColor(COLOR_WINDOWTEXT);
     displayAttrInfos_.push_back(inputAttrib_);
     // convertedAttrib_ = new DisplayAttributeInfo(g_convertedDisplayAttributeGuid);
     // displayAttrInfos_.push_back(convertedAttrib_);
