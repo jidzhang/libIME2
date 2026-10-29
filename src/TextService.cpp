@@ -482,15 +482,22 @@ int inputRectScore(const RECT& rect, const RECT* foregroundRect, bool preferSele
     const int width = rect.right - rect.left;
     const int height = rect.bottom - rect.top;
 
-    if (width < 0 || height < 0) {
+    // 高度 0~1px 的"矩形"不可能是一行文字：CUAS 对纯 IMM 宿主（wezterm 类）
+    // 代理出的幽灵点恒定在屏幕右下（实测全屏时 (1913,931,1914,931)，不随
+    // 光标/pane 动），旧的 -30 罚分会被"在前景窗内 +40"翻正，短路 IMM32
+    // 救援层，把候选窗钉死在屏幕右下。真锚点最矮也是终端光标格（约 20px）。
+    // 直接判废，任何奖励不得翻正。
+    if (height <= 1) {
+        return -1000;
+    }
+
+    if (width < 0) {
         score -= 100;
     } else {
         if (width == 0) {
             score -= 10;
         }
-        if (height == 0) {
-            score -= 30;
-        } else if (height < 8) {
+        if (height < 8) {
             score -= 10;
         }
     }
