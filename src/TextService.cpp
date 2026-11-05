@@ -22,6 +22,7 @@
 #include "DebugLogFile.h"
 #include "EditSession.h"
 #include "CandidateWindow.h"
+#include "InputRectScore.h"
 #include "LangBarButton.h"
 #include "DisplayAttributeInfoEnum.h"
 #include "ImeModule.h"
@@ -193,10 +194,6 @@ bool getForegroundWindowRect(RECT* rect) {
 
     const HWND foregroundWindow = ::GetForegroundWindow();
     return foregroundWindow && ::GetWindowRect(foregroundWindow, rect);
-}
-
-int absoluteDiff(int lhs, int rhs) {
-    return lhs > rhs ? lhs - rhs : rhs - lhs;
 }
 
 // 系统 UI 字体（菜单/消息框字体）行高，供"宿主字体取不到"时的参照上界。
@@ -477,55 +474,7 @@ bool realCaretScreenRect(RECT* rect, const wchar_t** whyNot, bool* heightSuspici
     return true;
 }
 
-int inputRectScore(const RECT& rect, const RECT* foregroundRect, bool preferSelection) {
-    int score = preferSelection ? 1 : 0;
-    const int width = rect.right - rect.left;
-    const int height = rect.bottom - rect.top;
-
-    // 高度 0~1px 的"矩形"不可能是一行文字：CUAS 对纯 IMM 宿主（wezterm 类）
-    // 代理出的幽灵点恒定在屏幕右下（实测全屏时 (1913,931,1914,931)，不随
-    // 光标/pane 动），旧的 -30 罚分会被"在前景窗内 +40"翻正，短路 IMM32
-    // 救援层，把候选窗钉死在屏幕右下。真锚点最矮也是终端光标格（约 20px）。
-    // 直接判废，任何奖励不得翻正。
-    if (height <= 1) {
-        return -1000;
-    }
-
-    if (width < 0) {
-        score -= 100;
-    } else {
-        if (width == 0) {
-            score -= 10;
-        }
-        if (height < 8) {
-            score -= 10;
-        }
-    }
-
-    if (!foregroundRect) {
-        return score;
-    }
-
-    const bool insideForeground =
-        rect.left >= foregroundRect->left && rect.left <= foregroundRect->right &&
-        rect.top >= foregroundRect->top && rect.top <= foregroundRect->bottom;
-    if (insideForeground) {
-        score += 40;
-    } else {
-        score -= 20;
-    }
-
-    const bool tinyTopLeftMarker =
-        absoluteDiff(rect.left, foregroundRect->left) <= 48 &&
-        absoluteDiff(rect.top, foregroundRect->top) <= 48 &&
-        width <= 4 &&
-        height > 0 && height <= 48;
-    if (tinyTopLeftMarker) {
-        score -= 80;
-    }
-
-    return score;
-}
+// inputRectScore/absoluteDiff 已抽到 InputRectScore.h（纯函数，供单测）。
 
 } // namespace
 
