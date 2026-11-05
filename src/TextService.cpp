@@ -565,15 +565,32 @@ DWORD TextService::langBarStatus() const {
     return 0;
 }
 
-void TextService::addButton(LangBarButton* button) {
-    if(button) {
-        langBarButtons_.emplace_back(button);
-        if(isActivated()) {
-            if(auto langBarItemMgr = threadMgr_.query<ITfLangBarItemMgr>()) {
-                langBarItemMgr->AddItem(button);
-            }
-        }
+HRESULT TextService::addLangBarItem(LangBarButton* button) {
+    auto langBarItemMgr = threadMgr_.query<ITfLangBarItemMgr>();
+    if(!langBarItemMgr) {
+        return E_FAIL;
     }
+    HRESULT hr = langBarItemMgr->AddItem(button);
+    if(FAILED(hr)) {
+        // 同一 GUID 的陈旧项还挂在本线程的语言栏管理器里时 AddItem 会失败
+        // （上一次 RemoveItem 没走通，或在同一 GUID 上换过按钮对象）——此时
+        // 新按钮永远不会出现在语言栏上，且对用户是"图标莫名其妙没了"。
+        // 先摘再挂一次即可自愈。
+        langBarItemMgr->RemoveItem(button);
+        hr = langBarItemMgr->AddItem(button);
+    }
+    return hr;
+}
+
+HRESULT TextService::addButton(LangBarButton* button) {
+    if(!button) {
+        return E_INVALIDARG;
+    }
+    langBarButtons_.emplace_back(button);
+    if(!isActivated()) {
+        return S_FALSE; // 激活时 activateLanguageButtons() 会统一挂上
+    }
+    return addLangBarItem(button);
 }
 
 void TextService::removeButton(LangBarButton* button) {
@@ -588,6 +605,20 @@ void TextService::removeButton(LangBarButton* button) {
             }
             langBarButtons_.erase(it);
         }
+    }
+}
+
+void TextService::clearLangBarButtons() {
+    if(!langBarButtons_.empty()) {
+        if(auto langBarItemMgr = threadMgr_.query<ITfLangBarItemMgr>()) {
+            for (auto& button : langBarButtons_) {
+                langBarItemMgr->RemoveItem(button);
+            }
+        }
+        // 必须 clear：按钮里的 ComPtr<TextService> 持有本对象的引用，
+        // 不清就成环（TextService→vector→按钮→TextService），线程退出时
+        // 整张图永不析构。重新激活时由 onActivate 响应重建（addButton 全套）。
+        langBarButtons_.clear();
     }
 }
 
@@ -1387,10 +1418,8 @@ void TextService::activateLanguageButtons() {
     }
     // Note: language bar has no effects in Win 8 immersive mode
     if (!langBarButtons_.empty()) {
-        if (auto langBarItemMgr = threadMgr_.query<ITfLangBarItemMgr>()) {
-            for (auto& button : langBarButtons_) {
-                langBarItemMgr->AddItem(button);
-            }
+        for (auto& button : langBarButtons_) {
+            addLangBarItem(button);
         }
     }
 }

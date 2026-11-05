@@ -117,8 +117,15 @@ public:
     DWORD langBarStatus() const;
 
     // language bar buttons
-    void addButton(LangBarButton* button);
+    // addButton 返回 ITfLangBarItemMgr::AddItem 的结果：注册失败=这个按钮在
+    // 本线程语言栏上永远不会出现（调用方据此记日志，bug#21）。
+    HRESULT addButton(LangBarButton* button);
     void removeButton(LangBarButton* button);
+    // 反激活时彻底清空按钮表（RemoveItem + 清 vector）。按钮对象持有
+    // ComPtr<TextService>，若只在 Deactivate 里 RemoveItem 而不清 vector，
+    // "TextService→vector→按钮→TextService" 的引用环会让整个图永不析构
+    //（每死一个线程漏一份，2026-11-05 晚自查发现）。
+    void clearLangBarButtons();
 
     // preserved keys
     void addPreservedKey(UINT keyCode, UINT modifiers, const GUID& guid);
@@ -304,6 +311,7 @@ protected:
 
     void activateLanguageButtons();
     void deactivateLanguageButtons();
+    HRESULT addLangBarItem(LangBarButton* button);
 
 protected: // COM object should not be deleted directly. calling Release() instead.
     virtual ~TextService(void);
