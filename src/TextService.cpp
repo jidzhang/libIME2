@@ -474,8 +474,6 @@ bool realCaretScreenRect(RECT* rect, const wchar_t** whyNot, bool* heightSuspici
     return true;
 }
 
-// inputRectScore/absoluteDiff 已抽到 InputRectScore.h（纯函数，供单测）。
-
 } // namespace
 
 TextService::TextService(ImeModule* module):

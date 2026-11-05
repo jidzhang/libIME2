@@ -1,6 +1,5 @@
 #pragma once
-// 候选窗锚点矩形可信度评分（纯函数，2026-11-05 从 TextService.cpp 抽出
-// 以便单测；行为逐字节不变）。
+// 候选窗锚点矩形可信度评分（纯函数，TextService.cpp 与单测共用）。
 //
 // inputRect 三级取数（真插入符/TSF 组字起点/last-good）+ IMM32 救援层用
 // 同一把尺子给候选锚点打分：高度 ≤1px 的 CUAS 幽灵点直接判废（-1000，

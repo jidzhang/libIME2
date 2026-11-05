@@ -14,6 +14,7 @@ add_library(libIME2_static STATIC
     DebugLogConfig.h
     TextService.cpp
     TextService.h
+    InputRectScore.h
     KeyEvent.cpp
     KeyEvent.h
     EditSession.cpp
