@@ -147,6 +147,12 @@ public:
     // 见 insertTextAtSelection——组字带文本定稿时 XAML 宿主会把定稿范围
     // 重新选中，清空后结束则绕开该路径）。
     void endComposition(ITfContext* context, bool clearText = false);
+    // 组字区直接写入最终文本后结束（微软官方提交时序）：自研编辑器
+    //（kimi 类）在 compositionend 里固化组字内容，"清空+另插"会被它当
+    // 外部修改丢弃；文本随 range 定稿则模型无缝替换。caretFromEnd>0 时
+    // 结束后选区落在文本末尾左移该值处（自动配对符号光标）。
+    void endCompositionWithText(ITfContext* context, const wchar_t* str,
+                                int len, int caretFromEnd);
     // 不经组字的普通文本插入（direct commit）：InsertTextAtSelection(flags=0)
     // 后把选区折叠到插入文本末尾左移 caretFromEnd 处（自动配对符号传 1，
     // 光标落在配对中间；普通上屏传 0）。

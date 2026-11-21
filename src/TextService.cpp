@@ -782,6 +782,69 @@ void TextService::endComposition(ITfContext* context, bool clearText) {
     collapseSelectionAfterCompositionEnd(context);
 }
 
+// 组字区直接定稿（2026-11-21 kimi 修复）：SetText(最终文本) → 清属性 →
+// EndComposition → 后置选区（压住 XAML 宿主在 end-composition 通知里的
+// 整段重选，见 endComposition 内注释）。与"清空+插入"（weasel#107）的
+// 适用边界：自研编辑器（kimi/ProseMirror 类）必须走本路径——它们在
+// compositionend 时固化组字内容，随后的外部插入会被模型丢弃；XAML 宿主
+// 的重选由后置 SetSelection 压制（我们晚于通知执行）。
+void TextService::endCompositionWithText(ITfContext* context, const wchar_t* str,
+                                         int len, int caretFromEnd) {
+    assert(context);
+    HRESULT sessionResult;
+    auto editSession = ComPtr<EditSession>::make(        context,
+        [=](EditSession* session, TfEditCookie cookie) {
+            if (composition_) {
+                ComPtr<ITfRange> compositionRange;
+                if (composition_->GetRange(&compositionRange) == S_OK &&
+                    str != nullptr && len > 0) {
+                    // 组字区内容替换为最终提交文本（TF_ST_CORRECTION：
+                    // 这是同一 range 的内容修正，不是新插入）
+                    compositionRange->SetText(cookie, TF_ST_CORRECTION, str, len);
+                    logTextServiceDebug(std::wstring(L"[endCompositionWithText] finalized len=") +
+                                        std::to_wstring(len));
+                    // 清显示属性（组字下划线等）
+                    ComPtr<ITfProperty> dispAttrProp;
+                    if (context->GetProperty(GUID_PROP_ATTRIBUTE, &dispAttrProp) == S_OK) {
+                        dispAttrProp->Clear(cookie, compositionRange);
+                    }
+                }
+                composition_->EndComposition(cookie);
+                logSelectionTrace(L"endcomp-text-after-endcomp", context, cookie);
+
+                if (compositionRange) {
+                    // 选区=提交文本末尾（caretFromEnd>0 时左移，自动配对光标）
+                    TF_SELECTION selection;
+                    ULONG selectionNum;
+                    if (context->GetSelection(cookie, TF_DEFAULT_SELECTION, 1,
+                                              &selection, &selectionNum) == S_OK) {
+                        selection.range->ShiftEndToRange(cookie, compositionRange,
+                                                         TF_ANCHOR_END);
+                        selection.range->Collapse(cookie, TF_ANCHOR_END);
+                        if (caretFromEnd > 0) {
+                            selection.range->ShiftStart(cookie, -caretFromEnd, nullptr,
+                                                        nullptr);
+                            selection.range->ShiftEnd(cookie, -caretFromEnd, nullptr,
+                                                      nullptr);
+                        }
+                        context->SetSelection(cookie, 1, &selection);
+                        selection.range->Release();
+                    }
+                }
+                logSelectionTrace(L"endcomp-text-after-setselection", context, cookie);
+                onCompositionTerminated(false);
+                composition_ = nullptr;
+                dummyCompositionActive_ = false;
+                hasLastKnownGoodInputRect_ = false;
+                hasCompositionAnchor_ = false;
+                logTextServiceDebug(L"[endCompositionWithText] ended");
+            }
+        }
+    );
+    context->RequestEditSession(clientId_, editSession, TF_ES_SYNC|TF_ES_READWRITE, &sessionResult);
+    collapseSelectionAfterCompositionEnd(context);
+}
+
 // 上屏选区追踪：dump 当前 TSF 选区（ACP 位置），定位宿主（便笺/XAML）把
 // 选区改回"整段选中"发生在哪一步。trace 档才输出。
 static void logSelectionTrace(const wchar_t* tag, ITfContext* context, TfEditCookie cookie) {
